@@ -3438,29 +3438,83 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
         LOG(ERROR) << "Failed to get bucket metadata path, bucket_id=" << id;
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    auto meta_path = meta_path_res.value();
-    auto open_file_result = OpenFile(meta_path, FileMode::Write);
+    const std::string meta_path = meta_path_res.value();
+    const std::string tmp_path = meta_path + ".tmp";
+
+    std::string str;
+    try {
+        struct_pb::to_pb(*metadata, str);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "struct_pb::to_pb failed for bucket " << id << ": "
+                   << e.what();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    // Publish atomically: write a temporary file, flush it to stable storage,
+    // rename it over the metadata file, then fsync the directory. Writing the
+    // metadata file in place and closing it leaves the bytes in the page cache,
+    // so a crash can keep the bucket data but lose or truncate its metadata;
+    // Init then treats the bucket as corrupt and deletes it, losing objects
+    // that were already acknowledged to the master. SaveMetadata() uses the
+    // same write-fsync-rename-fsyncdir order for the allocator state. The
+    // ".tmp" suffix keeps the file out of the Init scan, which selects files
+    // by the ".meta" extension.
+    ::unlink(tmp_path.c_str());
+
+    auto open_file_result = OpenFile(tmp_path, FileMode::Write);
     if (!open_file_result) {
-        LOG(ERROR) << "Failed to open file for bucket writing: " << meta_path;
+        LOG(ERROR) << "Failed to open metadata tmp file: " << tmp_path;
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
     auto file = std::move(open_file_result.value());
-    std::string str;
-    struct_pb::to_pb(*metadata, str);
     auto write_result = file->write(str, str.size());
     if (!write_result) {
-        LOG(ERROR) << "Write failed for: " << meta_path
+        LOG(ERROR) << "Write failed for: " << tmp_path
                    << ", error: " << write_result.error();
+        ::unlink(tmp_path.c_str());
         return tl::make_unexpected(write_result.error());
     }
     if (write_result.value() != str.size()) {
-        LOG(ERROR) << "Write size mismatch for: " << meta_path
+        LOG(ERROR) << "Write size mismatch for: " << tmp_path
                    << ", expected: " << str.size()
                    << ", got: " << write_result.value();
+        ::unlink(tmp_path.c_str());
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
+
+    auto sync_result = file->datasync();
+    if (!sync_result) {
+        LOG(ERROR) << "datasync failed for bucket metadata: " << tmp_path;
+        ::unlink(tmp_path.c_str());
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    file.reset();
+
+    if (::rename(tmp_path.c_str(), meta_path.c_str()) != 0) {
+        LOG(ERROR) << "rename " << tmp_path << " -> " << meta_path
+                   << " failed: " << strerror(errno);
+        ::unlink(tmp_path.c_str());
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    fs::path parent = fs::path(meta_path).parent_path();
+    if (parent.empty()) parent = ".";
+    int dir_fd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0) {
+        LOG(ERROR) << "open parent dir failed for " << parent << ": "
+                   << strerror(errno);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    FdGuard dir_guard(dir_fd);
+    if (::fsync(dir_fd) != 0) {
+        LOG(ERROR) << "fsync parent dir failed for " << parent << ": "
+                   << strerror(errno);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
     metadata->meta_size = str.size();
     return {};
+
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
